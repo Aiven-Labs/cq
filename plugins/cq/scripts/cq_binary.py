@@ -24,7 +24,7 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-REPO = "mozilla-ai/cq"  # Always download from upstream, even when installed from forks
+REPO = "Aiven-Labs/cq"  # Download from fork releases
 
 
 def cq_binary_name() -> str:
