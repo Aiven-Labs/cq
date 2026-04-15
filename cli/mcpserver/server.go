@@ -12,6 +12,7 @@ import (
 // Client is the cq client this server delegates to.
 type Client interface {
 	Confirm(ctx context.Context, ku cq.KnowledgeUnit) (cq.KnowledgeUnit, error)
+	Delete(ctx context.Context, ku cq.KnowledgeUnit) (cq.DeleteResult, error)
 	Drain(ctx context.Context) (cq.DrainResult, error)
 	Flag(ctx context.Context, ku cq.KnowledgeUnit, reason cq.FlagReason, opts ...cq.FlagOption) (cq.KnowledgeUnit, error)
 	HasRemote() bool
@@ -41,6 +42,7 @@ func New(client Client, ver string) *Server {
 	srv.mcpSrv.AddTool(QueryTool(), srv.HandleQuery)
 	srv.mcpSrv.AddTool(ProposeTool(), srv.HandlePropose)
 	srv.mcpSrv.AddTool(ConfirmTool(), srv.HandleConfirm)
+	srv.mcpSrv.AddTool(DeleteTool(), srv.HandleDelete)
 	srv.mcpSrv.AddTool(FlagTool(), srv.HandleFlag)
 	srv.mcpSrv.AddTool(StatusTool(), srv.HandleStatus)
 

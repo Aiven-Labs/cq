@@ -93,6 +93,43 @@ func (c *Client) Approve(ctx context.Context, unitID string) (ApproveResult, err
 	return result, nil
 }
 
+// Delete permanently removes a knowledge unit.
+// Routes to local store or remote API based on the unit's tier.
+func (c *Client) Delete(ctx context.Context, ku KnowledgeUnit) (DeleteResult, error) {
+	ctx, cancel := c.operationContext(ctx)
+	defer cancel()
+
+	if err := ctx.Err(); err != nil {
+		return DeleteResult{}, err
+	}
+
+	if !ku.Tier.IsRemote() {
+		if err := c.store.delete(ku.ID); err != nil {
+			return DeleteResult{}, fmt.Errorf("%w: %s", ErrNotFound, ku.ID)
+		}
+
+		return DeleteResult{
+			UnitID: ku.ID,
+			Status: "deleted",
+		}, nil
+	}
+
+	if c.remote == nil {
+		return DeleteResult{}, fmt.Errorf(
+			"knowledge unit %s has tier %s but no remote API is configured",
+			ku.ID,
+			ku.Tier,
+		)
+	}
+
+	result, err := c.remote.deleteUnit(ctx, ku.ID)
+	if err != nil {
+		return DeleteResult{}, fmt.Errorf("remote delete failed: %w", err)
+	}
+
+	return result, nil
+}
+
 // Confirm boosts the confidence of a knowledge unit.
 // Routes to local store or remote API based on the unit's tier.
 func (c *Client) Confirm(ctx context.Context, ku KnowledgeUnit) (KnowledgeUnit, error) {

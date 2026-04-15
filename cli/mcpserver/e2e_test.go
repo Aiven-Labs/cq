@@ -23,6 +23,7 @@ func newMCPTestClient(t *testing.T, srv *mcpserver.Server) *client.Client {
 		{Tool: mcpserver.QueryTool(), Handler: srv.HandleQuery},
 		{Tool: mcpserver.ProposeTool(), Handler: srv.HandlePropose},
 		{Tool: mcpserver.ConfirmTool(), Handler: srv.HandleConfirm},
+		{Tool: mcpserver.DeleteTool(), Handler: srv.HandleDelete},
 		{Tool: mcpserver.FlagTool(), Handler: srv.HandleFlag},
 		{Tool: mcpserver.StatusTool(), Handler: srv.HandleStatus},
 	}
@@ -94,6 +95,37 @@ func TestE2EProposeQueryConfirmFlagStatus(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.False(t, flagResult.IsError)
+
+	// Propose a second unit, then delete it.
+	propose2Result, err := c.CallTool(ctx, mcp.CallToolRequest{
+		Params: mcp.CallToolParams{
+			Name: "propose",
+			Arguments: map[string]any{
+				"summary": "Deletable insight",
+				"detail":  "Will be deleted.",
+				"action":  "Delete me.",
+				"domain":  []any{"testing"},
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.False(t, propose2Result.IsError)
+
+	var proposed2 cq.KnowledgeUnit
+	propose2Text := propose2Result.Content[0].(mcp.TextContent).Text
+	require.NoError(t, json.Unmarshal([]byte(propose2Text), &proposed2))
+
+	deleteResult, err := c.CallTool(ctx, mcp.CallToolRequest{
+		Params: mcp.CallToolParams{Name: "delete", Arguments: map[string]any{"unit_id": proposed2.ID}},
+	})
+	require.NoError(t, err)
+	require.False(t, deleteResult.IsError)
+
+	var deleted cq.DeleteResult
+	deleteText := deleteResult.Content[0].(mcp.TextContent).Text
+	require.NoError(t, json.Unmarshal([]byte(deleteText), &deleted))
+	require.Equal(t, proposed2.ID, deleted.UnitID)
+	require.Equal(t, "deleted", deleted.Status)
 
 	statusResult, err := c.CallTool(ctx, mcp.CallToolRequest{
 		Params: mcp.CallToolParams{Name: "status", Arguments: map[string]any{}},

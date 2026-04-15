@@ -20,6 +20,14 @@ type ApproveResult struct {
 	ReviewedAt string `json:"reviewed_at"`
 }
 
+// DeleteResult holds the outcome of a delete operation.
+type DeleteResult struct {
+	UnitID     string `json:"unit_id"`
+	Status     string `json:"status"`
+	ReviewedBy string `json:"reviewed_by"`
+	ReviewedAt string `json:"reviewed_at"`
+}
+
 // DrainResult holds the outcome of a drain operation.
 type DrainResult struct {
 	Pushed   int      `json:"pushed"`

@@ -11,6 +11,7 @@ var errMockNotImplemented = errors.New("mock method not implemented")
 
 type mockClient struct {
 	confirmFn   func(ctx context.Context, ku cq.KnowledgeUnit) (cq.KnowledgeUnit, error)
+	deleteFn    func(ctx context.Context, ku cq.KnowledgeUnit) (cq.DeleteResult, error)
 	drainFn     func(ctx context.Context) (cq.DrainResult, error)
 	flagFn      func(ctx context.Context, ku cq.KnowledgeUnit, reason cq.FlagReason, opts ...cq.FlagOption) (cq.KnowledgeUnit, error)
 	hasRemote bool
@@ -26,6 +27,14 @@ func (m *mockClient) Confirm(ctx context.Context, ku cq.KnowledgeUnit) (cq.Knowl
 	}
 
 	return m.confirmFn(ctx, ku)
+}
+
+func (m *mockClient) Delete(ctx context.Context, ku cq.KnowledgeUnit) (cq.DeleteResult, error) {
+	if m.deleteFn == nil {
+		return cq.DeleteResult{}, errMockNotImplemented
+	}
+
+	return m.deleteFn(ctx, ku)
 }
 
 func (m *mockClient) Drain(ctx context.Context) (cq.DrainResult, error) {
