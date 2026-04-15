@@ -47,6 +47,7 @@ export function Layout() {
           <div className="flex items-center gap-3 md:gap-6">
             <span className="text-lg font-bold text-indigo-600">cq</span>
             {navLink("/review", "Review")}
+            {navLink("/explore", "Explore")}
             {navLink("/dashboard", "Dashboard")}
           </div>
           <div className="flex items-center gap-3">

@@ -5,6 +5,7 @@ import { Layout } from "./components/Layout";
 import { LoginPage } from "./pages/LoginPage";
 import { ReviewPage } from "./pages/ReviewPage";
 import { DashboardPage } from "./pages/DashboardPage";
+import { ExplorerPage } from "./pages/ExplorerPage";
 
 function AppRoutes() {
   const { isAuthenticated } = useAuth();
@@ -22,6 +23,7 @@ function AppRoutes() {
         }
       >
         <Route path="/review" element={<ReviewPage />} />
+        <Route path="/explore" element={<ExplorerPage />} />
         <Route path="/dashboard" element={<DashboardPage />} />
       </Route>
       <Route path="*" element={<Navigate to="/review" replace />} />
