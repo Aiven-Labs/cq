@@ -6,10 +6,11 @@ Implements the context manager protocol for deterministic resource cleanup.
 """
 
 import os
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import TracebackType
-from typing import Any
+from typing import Any, cast
 
 from cq.models import KnowledgeUnit
 from sqlalchemy import create_engine, event, text
@@ -98,6 +99,7 @@ class RemoteStore:
 
         # SQLite-specific pragmas via event listener
         if database_url.startswith("sqlite"):
+
             @event.listens_for(engine, "connect")
             def set_sqlite_pragmas(dbapi_conn, _connection_record):
                 dbapi_conn.execute("PRAGMA foreign_keys = ON")
@@ -116,9 +118,12 @@ class RemoteStore:
                 if statement:
                     conn.execute(text(statement))
             # Note: ensure_review_columns and ensure_users_table still expect raw connection
-            # We'll need to pass the underlying DBAPI connection
-            ensure_review_columns(conn.connection.dbapi_connection)
-            ensure_users_table(conn.connection.dbapi_connection)
+            # Get the underlying DBAPI connection (guaranteed non-None in active connection)
+            dbapi_conn = conn.connection.dbapi_connection
+            assert dbapi_conn is not None  # type narrowing for type checker
+            # Cast to sqlite3.Connection for type checker (it's a DBAPIConnection at runtime)
+            ensure_review_columns(cast(sqlite3.Connection, dbapi_conn))
+            ensure_users_table(cast(sqlite3.Connection, dbapi_conn))
 
     def _check_open(self) -> None:
         """Raise if the store has been closed."""
@@ -171,7 +176,9 @@ class RemoteStore:
         )
         with self._engine.begin() as conn:
             conn.execute(
-                text("INSERT INTO knowledge_units (id, data, created_at, tier) VALUES (:id, :data, :created_at, :tier)"),
+                text(
+                    "INSERT INTO knowledge_units (id, data, created_at, tier) VALUES (:id, :data, :created_at, :tier)"
+                ),
                 {"id": unit.id, "data": data, "created_at": created_at, "tier": unit.tier.value},
             )
             for domain in domains:
@@ -258,7 +265,10 @@ class RemoteStore:
         now = datetime.now(UTC).isoformat()
         with self._engine.begin() as conn:
             result = conn.execute(
-                text("UPDATE knowledge_units SET status = :status, reviewed_by = :reviewed_by, reviewed_at = :reviewed_at WHERE id = :id"),
+                text(
+                    "UPDATE knowledge_units SET status = :status, reviewed_by = :reviewed_by, "
+                    "reviewed_at = :reviewed_at WHERE id = :id"
+                ),
                 {"status": status, "reviewed_by": reviewed_by, "reviewed_at": now, "id": unit_id},
             )
             if result.rowcount == 0:
@@ -350,7 +360,7 @@ class RemoteStore:
             return []
         # Build named parameters for each domain
         params = {f"domain_{i}": d for i, d in enumerate(normalized)}
-        placeholders = ",".join(f":{name}" for name in params.keys())
+        placeholders = ",".join(f":{name}" for name in params)
         sql = f"""
             SELECT ku.data
             FROM knowledge_units ku
@@ -386,6 +396,7 @@ class RemoteStore:
         self._check_open()
         with self._engine.connect() as conn:
             row = conn.execute(text("SELECT COUNT(*) FROM knowledge_units")).fetchone()
+        assert row is not None  # COUNT always returns a row
         return row[0]
 
     def domain_counts(self) -> dict[str, int]:
@@ -393,11 +404,13 @@ class RemoteStore:
         self._check_open()
         with self._engine.connect() as conn:
             rows = conn.execute(
-                text("SELECT d.domain, COUNT(*) "
-                     "FROM knowledge_unit_domains d "
-                     "JOIN knowledge_units ku ON ku.id = d.unit_id "
-                     "WHERE ku.status = 'approved' "
-                     "GROUP BY d.domain ORDER BY COUNT(*) DESC")
+                text(
+                    "SELECT d.domain, COUNT(*) "
+                    "FROM knowledge_unit_domains d "
+                    "JOIN knowledge_units ku ON ku.id = d.unit_id "
+                    "WHERE ku.status = 'approved' "
+                    "GROUP BY d.domain ORDER BY COUNT(*) DESC"
+                )
             ).fetchall()
         return {row[0]: row[1] for row in rows}
 
@@ -415,9 +428,11 @@ class RemoteStore:
         self._check_open()
         with self._engine.connect() as conn:
             rows = conn.execute(
-                text("SELECT data, status, reviewed_by, reviewed_at "
-                     "FROM knowledge_units WHERE status = 'pending' "
-                     "ORDER BY created_at ASC LIMIT :limit OFFSET :offset"),
+                text(
+                    "SELECT data, status, reviewed_by, reviewed_at "
+                    "FROM knowledge_units WHERE status = 'pending' "
+                    "ORDER BY created_at ASC LIMIT :limit OFFSET :offset"
+                ),
                 {"limit": limit, "offset": offset},
             ).fetchall()
         return [
@@ -435,6 +450,7 @@ class RemoteStore:
         self._check_open()
         with self._engine.connect() as conn:
             row = conn.execute(text("SELECT COUNT(*) FROM knowledge_units WHERE status = 'pending'")).fetchone()
+        assert row is not None  # COUNT always returns a row
         return row[0]
 
     def counts_by_status(self) -> dict[str, int]:
@@ -538,7 +554,10 @@ class RemoteStore:
         now = datetime.now(UTC).isoformat()
         with self._engine.begin() as conn:
             conn.execute(
-                text("INSERT INTO users (username, password_hash, created_at) VALUES (:username, :password_hash, :created_at)"),
+                text(
+                    "INSERT INTO users (username, password_hash, created_at) "
+                    "VALUES (:username, :password_hash, :created_at)"
+                ),
                 {"username": username, "password_hash": password_hash, "created_at": now},
             )
 
@@ -597,9 +616,11 @@ class RemoteStore:
         self._check_open()
         with self._engine.connect() as conn:
             rows = conn.execute(
-                text("SELECT id, data, status, reviewed_by, reviewed_at "
-                     "FROM knowledge_units "
-                     "ORDER BY COALESCE(reviewed_at, created_at) DESC LIMIT :limit"),
+                text(
+                    "SELECT id, data, status, reviewed_by, reviewed_at "
+                    "FROM knowledge_units "
+                    "ORDER BY COALESCE(reviewed_at, created_at) DESC LIMIT :limit"
+                ),
                 {"limit": limit * 2},
             ).fetchall()
         activity = []
@@ -656,26 +677,32 @@ class RemoteStore:
 
         with self._engine.connect() as conn:
             proposed_rows = conn.execute(
-                text("SELECT DATE(created_at) as day, COUNT(*) as cnt "
-                     "FROM knowledge_units "
-                     "WHERE created_at >= :cutoff "
-                     "GROUP BY DATE(created_at)"),
+                text(
+                    "SELECT DATE(created_at) as day, COUNT(*) as cnt "
+                    "FROM knowledge_units "
+                    "WHERE created_at >= :cutoff "
+                    "GROUP BY DATE(created_at)"
+                ),
                 {"cutoff": cutoff},
             ).fetchall()
             approved_rows = conn.execute(
-                text("SELECT DATE(reviewed_at) as day, COUNT(*) as cnt "
-                     "FROM knowledge_units "
-                     "WHERE status = 'approved' "
-                     "AND reviewed_at >= :cutoff "
-                     "GROUP BY DATE(reviewed_at)"),
+                text(
+                    "SELECT DATE(reviewed_at) as day, COUNT(*) as cnt "
+                    "FROM knowledge_units "
+                    "WHERE status = 'approved' "
+                    "AND reviewed_at >= :cutoff "
+                    "GROUP BY DATE(reviewed_at)"
+                ),
                 {"cutoff": cutoff},
             ).fetchall()
             rejected_rows = conn.execute(
-                text("SELECT DATE(reviewed_at) as day, COUNT(*) as cnt "
-                     "FROM knowledge_units "
-                     "WHERE status = 'rejected' "
-                     "AND reviewed_at >= :cutoff "
-                     "GROUP BY DATE(reviewed_at)"),
+                text(
+                    "SELECT DATE(reviewed_at) as day, COUNT(*) as cnt "
+                    "FROM knowledge_units "
+                    "WHERE status = 'rejected' "
+                    "AND reviewed_at >= :cutoff "
+                    "GROUP BY DATE(reviewed_at)"
+                ),
                 {"cutoff": cutoff},
             ).fetchall()
         proposed = {row[0]: row[1] for row in proposed_rows}
