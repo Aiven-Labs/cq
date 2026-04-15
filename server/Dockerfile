@@ -37,6 +37,9 @@ RUN uv sync --no-dev --frozen --no-install-project
 COPY backend/src/ src/
 RUN uv sync --no-dev --frozen
 
+COPY scripts/ scripts/
+RUN chmod +x /app/scripts/entrypoint.sh
+
 # Copy the frontend build output into the package's static directory.
 COPY --from=frontend /build/dist src/cq_server/static/
 
@@ -55,5 +58,5 @@ LABEL org.opencontainers.image.source="https://github.com/mozilla-ai/cq" \
       org.opencontainers.image.description="cq knowledge store server" \
       org.opencontainers.image.licenses="Apache-2.0"
 
-CMD ["python3 /app/scripts/seed-users.py --username demo --password demo123 ; /bin/sh"]
-ENTRYPOINT ["/app/.venv/bin/cq-server"]
+ENTRYPOINT ["/app/scripts/entrypoint.sh"]
+CMD ["/app/.venv/bin/cq-server"]
