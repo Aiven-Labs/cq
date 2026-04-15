@@ -74,11 +74,30 @@ class RemoteStore:
         self._ensure_schema()
 
     def _create_engine(self) -> Engine:
-        """Create and configure a SQLAlchemy engine."""
-        engine = create_engine(self._database_url)
+        """Create and configure a SQLAlchemy engine.
+
+        For PostgreSQL, use postgresql+psycopg:// URLs to explicitly use psycopg (v3).
+        """
+        # Normalize PostgreSQL URLs: postgresql:// -> postgresql+psycopg://
+        database_url = self._database_url
+        if database_url.startswith("postgresql://"):
+            database_url = database_url.replace("postgresql://", "postgresql+psycopg://", 1)
+
+        # PostgreSQL connection pool configuration
+        if database_url.startswith("postgresql"):
+            pool_size = int(os.environ.get("CQ_PG_POOL_SIZE", "10"))
+            max_overflow = int(os.environ.get("CQ_PG_POOL_OVERFLOW", "20"))
+            engine = create_engine(
+                database_url,
+                pool_size=pool_size,
+                max_overflow=max_overflow,
+                pool_pre_ping=True,  # Validate connections before use
+            )
+        else:
+            engine = create_engine(database_url)
 
         # SQLite-specific pragmas via event listener
-        if self._database_url.startswith("sqlite"):
+        if database_url.startswith("sqlite"):
             @event.listens_for(engine, "connect")
             def set_sqlite_pragmas(dbapi_conn, _connection_record):
                 dbapi_conn.execute("PRAGMA foreign_keys = ON")
@@ -635,34 +654,28 @@ class RemoteStore:
         # Compute cutoff date in Python (portable across backends)
         cutoff = (datetime.now(UTC) - timedelta(days=days)).date().isoformat()
 
-        # Build DATE() expression based on dialect
-        if self._db_type == "sqlite":
-            date_expr = "DATE"
-        else:  # PostgreSQL
-            date_expr = "DATE"  # DATE() function exists in both
-
         with self._engine.connect() as conn:
             proposed_rows = conn.execute(
-                text(f"SELECT {date_expr}(created_at) as day, COUNT(*) as cnt "
-                     f"FROM knowledge_units "
-                     f"WHERE created_at >= :cutoff "
-                     f"GROUP BY day"),
+                text("SELECT DATE(created_at) as day, COUNT(*) as cnt "
+                     "FROM knowledge_units "
+                     "WHERE created_at >= :cutoff "
+                     "GROUP BY DATE(created_at)"),
                 {"cutoff": cutoff},
             ).fetchall()
             approved_rows = conn.execute(
-                text(f"SELECT {date_expr}(reviewed_at) as day, COUNT(*) as cnt "
-                     f"FROM knowledge_units "
-                     f"WHERE status = 'approved' "
-                     f"AND reviewed_at >= :cutoff "
-                     f"GROUP BY day"),
+                text("SELECT DATE(reviewed_at) as day, COUNT(*) as cnt "
+                     "FROM knowledge_units "
+                     "WHERE status = 'approved' "
+                     "AND reviewed_at >= :cutoff "
+                     "GROUP BY DATE(reviewed_at)"),
                 {"cutoff": cutoff},
             ).fetchall()
             rejected_rows = conn.execute(
-                text(f"SELECT {date_expr}(reviewed_at) as day, COUNT(*) as cnt "
-                     f"FROM knowledge_units "
-                     f"WHERE status = 'rejected' "
-                     f"AND reviewed_at >= :cutoff "
-                     f"GROUP BY day"),
+                text("SELECT DATE(reviewed_at) as day, COUNT(*) as cnt "
+                     "FROM knowledge_units "
+                     "WHERE status = 'rejected' "
+                     "AND reviewed_at >= :cutoff "
+                     "GROUP BY DATE(reviewed_at)"),
                 {"cutoff": cutoff},
             ).fetchall()
         proposed = {row[0]: row[1] for row in proposed_rows}
