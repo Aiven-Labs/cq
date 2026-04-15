@@ -60,9 +60,10 @@ class TestInsertAndGet:
         assert retrieved == unit
 
     def test_insert_duplicate_raises(self, store: RemoteStore) -> None:
+        from sqlalchemy.exc import IntegrityError
         unit = _make_unit()
         store.insert(unit)
-        with pytest.raises(sqlite3.IntegrityError):
+        with pytest.raises(IntegrityError):
             store.insert(unit)
 
     def test_returns_none_for_missing_id(self, store: RemoteStore) -> None:
@@ -82,13 +83,14 @@ class TestDelete:
         assert store.get_any(unit.id) is None
 
     def test_delete_removes_domain_associations(self, store: RemoteStore) -> None:
+        from sqlalchemy import text
         unit = _make_unit(domains=["api", "payments"])
         store.insert(unit)
         store.delete(unit.id)
-        with store._lock:
-            rows = store._conn.execute(
-                "SELECT COUNT(*) FROM knowledge_unit_domains WHERE unit_id = ?",
-                (unit.id,),
+        with store._engine.connect() as conn:
+            rows = conn.execute(
+                text("SELECT COUNT(*) FROM knowledge_unit_domains WHERE unit_id = :unit_id"),
+                {"unit_id": unit.id},
             ).fetchone()
         assert rows[0] == 0
 
@@ -256,37 +258,45 @@ class TestStats:
 class TestTierColumn:
     def test_tier_column_exists_after_migration(self, store: RemoteStore) -> None:
         """The tier column should exist on the knowledge_units table."""
-        cursor = store._conn.execute("PRAGMA table_info(knowledge_units)")
-        columns = {row[1] for row in cursor.fetchall()}
+        from sqlalchemy import text
+        with store._engine.connect() as conn:
+            cursor = conn.execute(text("PRAGMA table_info(knowledge_units)"))
+            columns = {row[1] for row in cursor.fetchall()}
         assert "tier" in columns
 
     def test_tier_column_defaults_to_private_for_migration(self, store: RemoteStore) -> None:
         """Pre-existing rows without an explicit tier get 'private' from the column default."""
-        store._conn.execute(
-            "INSERT INTO knowledge_units (id, data, created_at) VALUES (?, ?, ?)",
-            ("ku_00000000000000000000000000000001", "{}", "2026-01-01T00:00:00Z"),
-        )
-        store._conn.commit()
-        row = store._conn.execute(
-            "SELECT tier FROM knowledge_units WHERE id = ?",
-            ("ku_00000000000000000000000000000001",),
-        ).fetchone()
+        from sqlalchemy import text
+        with store._engine.begin() as conn:
+            conn.execute(
+                text("INSERT INTO knowledge_units (id, data, created_at) VALUES (:id, :data, :created_at)"),
+                {"id": "ku_00000000000000000000000000000001", "data": "{}", "created_at": "2026-01-01T00:00:00Z"},
+            )
+        with store._engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT tier FROM knowledge_units WHERE id = :id"),
+                {"id": "ku_00000000000000000000000000000001"},
+            ).fetchone()
         assert row[0] == "private"
 
     def test_insert_populates_tier_from_unit(self, store: RemoteStore) -> None:
         """Insert should write the unit's tier value to the tier column."""
+        from sqlalchemy import text
         unit = _make_unit(tier=Tier.PRIVATE)
         store.insert(unit)
-        row = store._conn.execute("SELECT tier FROM knowledge_units WHERE id = ?", (unit.id,)).fetchone()
+        with store._engine.connect() as conn:
+            row = conn.execute(text("SELECT tier FROM knowledge_units WHERE id = :id"), {"id": unit.id}).fetchone()
         assert row[0] == "private"
 
     def test_update_syncs_tier_column(self, store: RemoteStore) -> None:
         """Update should keep the tier column in sync with the JSON blob."""
+        from sqlalchemy import text
         unit = _make_unit(tier=Tier.PRIVATE)
         store.insert(unit)
         updated = unit.model_copy(update={"tier": Tier.PUBLIC})
         store.update(updated)
-        row = store._conn.execute("SELECT tier FROM knowledge_units WHERE id = ?", (unit.id,)).fetchone()
+        with store._engine.connect() as conn:
+            row = conn.execute(text("SELECT tier FROM knowledge_units WHERE id = :id"), {"id": unit.id}).fetchone()
         assert row[0] == "public"
 
     def test_counts_by_tier_empty(self, store: RemoteStore) -> None:
@@ -449,10 +459,11 @@ class TestReviewQueue:
 
         store.set_review_status(u1.id, "approved", "reviewer")
         # Backdate reviewed_at to 1 day ago.
-        with store._lock, store._conn:
-            store._conn.execute(
-                "UPDATE knowledge_units SET reviewed_at = ? WHERE id = ?",
-                (one_day_ago.isoformat(), u1.id),
+        from sqlalchemy import text
+        with store._engine.begin() as conn:
+            conn.execute(
+                text("UPDATE knowledge_units SET reviewed_at = :reviewed_at WHERE id = :id"),
+                {"reviewed_at": one_day_ago.isoformat(), "id": u1.id},
             )
 
         counts = store.daily_counts(days=30)
@@ -479,11 +490,12 @@ class TestReviewQueue:
 
         store.set_review_status(unit.id, "rejected", "reviewer")
         # Backdate reviewed_at to today.
+        from sqlalchemy import text
         today = datetime.now(UTC)
-        with store._lock, store._conn:
-            store._conn.execute(
-                "UPDATE knowledge_units SET reviewed_at = ? WHERE id = ?",
-                (today.isoformat(), unit.id),
+        with store._engine.begin() as conn:
+            conn.execute(
+                text("UPDATE knowledge_units SET reviewed_at = :reviewed_at WHERE id = :id"),
+                {"reviewed_at": today.isoformat(), "id": unit.id},
             )
 
         counts = store.daily_counts(days=30)
