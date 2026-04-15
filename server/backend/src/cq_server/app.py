@@ -68,8 +68,16 @@ async def lifespan(app_instance: FastAPI) -> AsyncIterator[None]:
     jwt_secret = os.environ.get("CQ_JWT_SECRET")
     if not jwt_secret:
         raise RuntimeError("CQ_JWT_SECRET environment variable is required")
-    db_path = Path(os.environ.get("CQ_DB_PATH", "/data/cq.db"))
-    _store = RemoteStore(db_path=db_path)
+
+    # Configuration: CQ_DATABASE_URL takes precedence, fallback to CQ_DB_PATH
+    database_url = os.environ.get("CQ_DATABASE_URL")
+    if database_url:
+        _store = RemoteStore(database_url=database_url)
+    else:
+        # Backward compatibility: construct SQLite URL from CQ_DB_PATH
+        db_path = Path(os.environ.get("CQ_DB_PATH", "/data/cq.db"))
+        _store = RemoteStore(db_path=db_path)
+
     app_instance.state.store = _store
     yield
     _store.close()
