@@ -65,6 +65,38 @@ func (r *remoteClient) approve(ctx context.Context, unitID string) (ApproveResul
 	return result, nil
 }
 
+// deleteUnit deletes a unit on the remote API.
+// Returns errUnreachable on transport/5xx, RemoteError on 4xx.
+func (r *remoteClient) deleteUnit(ctx context.Context, unitID string) (DeleteResult, error) {
+	deleteURL, err := r.url("/review/" + url.PathEscape(unitID))
+	if err != nil {
+		return DeleteResult{}, fmt.Errorf("%w: %w", errUnreachable, err)
+	}
+
+	resp, err := r.do(ctx, http.MethodDelete, deleteURL, nil)
+	if err != nil {
+		return DeleteResult{}, fmt.Errorf("%w: %w", errUnreachable, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode >= 500 {
+		return DeleteResult{}, errUnreachable
+	}
+
+	if resp.StatusCode >= 400 {
+		detail, _ := io.ReadAll(resp.Body)
+
+		return DeleteResult{}, &RemoteError{StatusCode: resp.StatusCode, Detail: string(detail)}
+	}
+
+	var result DeleteResult
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return DeleteResult{}, fmt.Errorf("%w: decoding response: %w", errUnreachable, err)
+	}
+
+	return result, nil
+}
+
 // confirm confirms a unit on the remote API.
 // Returns errUnreachable on transport/5xx, RemoteError on 4xx.
 func (r *remoteClient) confirm(ctx context.Context, unitID string) (KnowledgeUnit, error) {

@@ -275,6 +275,32 @@ class Client:
             return result
         raise KeyError(f"Remote unreachable; cannot flag unit: {unit_id}")
 
+    def delete(self, unit_id: str, *, tier: Tier = Tier.LOCAL) -> None:
+        """Permanently delete a knowledge unit.
+
+        Routes to local store or remote API based on the unit's tier.
+
+        Args:
+            unit_id: The knowledge unit identifier.
+            tier: Where the unit is stored (LOCAL routes to local store,
+                PRIVATE/PUBLIC routes to remote API).
+
+        Raises:
+            KeyError: If the unit is not found in the local store (LOCAL tier).
+            RemoteError: If the remote API rejects the request (e.g. 404).
+            RuntimeError: If a non-local tier is specified without a remote API.
+        """
+        if tier == Tier.LOCAL:
+            unit = self._store.get(unit_id)
+            if unit is None:
+                raise KeyError(f"Knowledge unit not found: {unit_id}")
+            self._store.delete(unit_id)
+            return
+
+        if self._http is None:
+            raise RuntimeError("Cannot delete non-local unit without remote API configured")
+        self._remote_delete(unit_id)
+
     def status(self) -> StoreStats:
         """Return knowledge store statistics with tier counts.
 
@@ -440,6 +466,22 @@ class Client:
             raise RemoteError(
                 status_code=resp.status_code,
                 detail=f"Invalid response body: {exc}",
+            ) from exc
+
+    def _remote_delete(self, unit_id: str) -> None:
+        """Delete a unit on the remote API.
+
+        Raises:
+            RemoteError: If the remote API explicitly rejects the request.
+        """
+        assert self._http is not None
+        try:
+            resp = self._http.delete(f"/review/{unit_id}")
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise RemoteError(
+                status_code=exc.response.status_code,
+                detail=exc.response.text,
             ) from exc
 
     def _remote_flag(self, unit_id: str, reason: FlagReason) -> KnowledgeUnit | None:
