@@ -43,6 +43,7 @@ def test_main_loads_version_ensures_binary_and_replaces_process(monkeypatch, tmp
         "__file__",
         str(metadata.parent / "bootstrap.py"),
     )
+    monkeypatch.setattr(bootstrap, "_load_remote_min_version", lambda: "")
     monkeypatch.setattr(bootstrap.cq_binary, "shared_bin_dir", lambda: tmp_path / "bin")
     monkeypatch.setattr(bootstrap.cq_binary, "cq_binary_name", lambda: "cq")
 
@@ -66,6 +67,78 @@ def test_main_loads_version_ensures_binary_and_replaces_process(monkeypatch, tmp
     ]
 
 
+def test_main_prefers_newer_remote_min_version(monkeypatch, tmp_path):
+    metadata = tmp_path / "bootstrap.json"
+    metadata.write_text('{"cli_min_version": "0.2.0"}\n')
+
+    bootstrap = _load_bootstrap()
+    calls: list[tuple[str, tuple]] = []
+
+    monkeypatch.setattr(
+        bootstrap,
+        "__file__",
+        str(metadata.parent / "bootstrap.py"),
+    )
+    monkeypatch.setattr(bootstrap, "_load_remote_min_version", lambda: "0.2.3")
+    monkeypatch.setattr(bootstrap.cq_binary, "shared_bin_dir", lambda: tmp_path / "bin")
+    monkeypatch.setattr(bootstrap.cq_binary, "cq_binary_name", lambda: "cq")
+
+    def _fake_ensure(binary, required, bin_dir):
+        calls.append(("ensure", (binary, required, bin_dir)))
+
+    def _fake_replace(path, argv):
+        calls.append(("replace", (path, tuple(argv))))
+        raise SystemExit(0)
+
+    monkeypatch.setattr(bootstrap.cq_binary, "ensure_binary", _fake_ensure)
+    monkeypatch.setattr(bootstrap.os, "execvp", _fake_replace)
+
+    with pytest.raises(SystemExit) as exc_info:
+        bootstrap.main()
+
+    assert exc_info.value.code == 0
+    assert calls == [
+        ("ensure", (tmp_path / "bin" / "cq", "0.2.3", tmp_path / "bin")),
+        ("replace", (str(tmp_path / "bin" / "cq"), (str(tmp_path / "bin" / "cq"), "mcp"))),
+    ]
+
+
+def test_main_uses_remote_min_when_local_metadata_missing(monkeypatch, tmp_path):
+    metadata = tmp_path / "bootstrap.json"
+    metadata.write_text("{}\n")
+
+    bootstrap = _load_bootstrap()
+    calls: list[tuple[str, tuple]] = []
+
+    monkeypatch.setattr(
+        bootstrap,
+        "__file__",
+        str(metadata.parent / "bootstrap.py"),
+    )
+    monkeypatch.setattr(bootstrap, "_load_remote_min_version", lambda: "0.2.4")
+    monkeypatch.setattr(bootstrap.cq_binary, "shared_bin_dir", lambda: tmp_path / "bin")
+    monkeypatch.setattr(bootstrap.cq_binary, "cq_binary_name", lambda: "cq")
+
+    def _fake_ensure(binary, required, bin_dir):
+        calls.append(("ensure", (binary, required, bin_dir)))
+
+    def _fake_replace(path, argv):
+        calls.append(("replace", (path, tuple(argv))))
+        raise SystemExit(0)
+
+    monkeypatch.setattr(bootstrap.cq_binary, "ensure_binary", _fake_ensure)
+    monkeypatch.setattr(bootstrap.os, "execvp", _fake_replace)
+
+    with pytest.raises(SystemExit) as exc_info:
+        bootstrap.main()
+
+    assert exc_info.value.code == 0
+    assert calls == [
+        ("ensure", (tmp_path / "bin" / "cq", "0.2.4", tmp_path / "bin")),
+        ("replace", (str(tmp_path / "bin" / "cq"), (str(tmp_path / "bin" / "cq"), "mcp"))),
+    ]
+
+
 def test_main_exits_when_metadata_missing_version(monkeypatch, tmp_path, capsys):
     metadata = tmp_path / "bootstrap.json"
     metadata.write_text("{}\n")
@@ -76,6 +149,7 @@ def test_main_exits_when_metadata_missing_version(monkeypatch, tmp_path, capsys)
         "__file__",
         str(metadata.parent / "bootstrap.py"),
     )
+    monkeypatch.setattr(bootstrap, "_load_remote_min_version", lambda: "")
 
     with pytest.raises(SystemExit) as exc_info:
         bootstrap.main()
