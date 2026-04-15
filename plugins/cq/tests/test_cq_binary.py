@@ -281,12 +281,22 @@ def test_download_constructs_correct_url_for_aarch64_on_linux(cq_binary, monkeyp
         nonlocal captured_url
         captured_url = url
 
+    class _FakeTar:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def extract(self, _name, _dest):
+            raise AttributeError("stop after URL capture")
+
     monkeypatch.setattr(cq_binary.urllib.request, "urlretrieve", _fake_urlretrieve)
-    monkeypatch.setattr(cq_binary.tarfile, "open", lambda *_a, **_k: None)
+    monkeypatch.setattr(cq_binary.tarfile, "open", lambda *_a, **_k: _FakeTar())
 
     try:
         cq_binary.download("0.2.2", "Linux", bin_dir, binary)
     except AttributeError:
         pass
 
-    assert captured_url == "https://github.com/mozilla-ai/cq/releases/download/cli/v0.2.2/cq_Linux_arm64.tar.gz"
+    assert captured_url == f"https://github.com/{cq_binary.REPO}/releases/download/cli/v0.2.2/cq_Linux_arm64.tar.gz"
