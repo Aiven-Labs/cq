@@ -14,6 +14,8 @@ dependencies = [
     "pyjwt>=2.0",
     "bcrypt>=4.0",
     "cq-sdk~=0.6.1",
+    "sqlalchemy>=2.0.25,<3",
+    "psycopg[binary,pool]>=3.2.0,<4",
 ]
 
 [project.scripts]

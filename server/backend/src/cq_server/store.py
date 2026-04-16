@@ -5,14 +5,16 @@ Auto-creates the database directory and schema on first use.
 Implements the context manager protocol for deterministic resource cleanup.
 """
 
+import os
 import sqlite3
-import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import TracebackType
-from typing import Any
+from typing import Any, cast
 
 from cq.models import KnowledgeUnit
+from sqlalchemy import create_engine, event, text
+from sqlalchemy.engine import Engine
 
 from .scoring import calculate_relevance
 from .tables import ensure_review_columns, ensure_users_table
@@ -45,39 +47,83 @@ def normalize_domains(domains: list[str]) -> list[str]:
 class RemoteStore:
     """SQLite-backed remote knowledge store.
 
-    Holds a single persistent connection for the lifetime of the instance.
+    Uses SQLAlchemy Engine for database connections.
     Use as a context manager or call ``close()`` explicitly.
 
-    Thread-safe: all connection access is serialized via an internal lock.
+    Thread-safe: SQLAlchemy's connection pool handles thread safety.
     """
 
-    def __init__(self, db_path: Path | None = None) -> None:
+    def __init__(self, database_url: str | None = None, db_path: Path | None = None) -> None:
         """Initialise the store, creating the database and schema if needed.
 
         Args:
+            database_url: SQLAlchemy database URL. Takes precedence over db_path.
             db_path: Path to the SQLite database file. Defaults to /data/cq.db.
+                     Only used if database_url is not provided.
         """
-        self._db_path = db_path or DEFAULT_DB_PATH
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        if database_url:
+            self._database_url = database_url
+        else:
+            # Backward compatibility: construct URL from db_path
+            path = db_path or DEFAULT_DB_PATH
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self._database_url = f"sqlite:///{path}"
+
         self._closed = False
-        self._lock = threading.Lock()
-        self._conn = self._open_connection()
+        self._engine = self._create_engine()
+        self._db_type = self._engine.dialect.name
         self._ensure_schema()
 
-    def _open_connection(self) -> sqlite3.Connection:
-        """Open and configure a SQLite connection."""
-        conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA journal_mode = WAL")
-        conn.execute("PRAGMA synchronous = NORMAL")
-        conn.execute("PRAGMA busy_timeout = 5000")
-        return conn
+    def _create_engine(self) -> Engine:
+        """Create and configure a SQLAlchemy engine.
+
+        For PostgreSQL, use postgresql+psycopg:// URLs to explicitly use psycopg (v3).
+        """
+        # Normalize PostgreSQL URLs: postgresql:// -> postgresql+psycopg://
+        database_url = self._database_url
+        if database_url.startswith("postgresql://"):
+            database_url = database_url.replace("postgresql://", "postgresql+psycopg://", 1)
+
+        # PostgreSQL connection pool configuration
+        if database_url.startswith("postgresql"):
+            pool_size = int(os.environ.get("CQ_PG_POOL_SIZE", "10"))
+            max_overflow = int(os.environ.get("CQ_PG_POOL_OVERFLOW", "20"))
+            engine = create_engine(
+                database_url,
+                pool_size=pool_size,
+                max_overflow=max_overflow,
+                pool_pre_ping=True,  # Validate connections before use
+            )
+        else:
+            engine = create_engine(database_url)
+
+        # SQLite-specific pragmas via event listener
+        if database_url.startswith("sqlite"):
+
+            @event.listens_for(engine, "connect")
+            def set_sqlite_pragmas(dbapi_conn, _connection_record):
+                dbapi_conn.execute("PRAGMA foreign_keys = ON")
+                dbapi_conn.execute("PRAGMA journal_mode = WAL")
+                dbapi_conn.execute("PRAGMA synchronous = NORMAL")
+                dbapi_conn.execute("PRAGMA busy_timeout = 5000")
+
+        return engine
 
     def _ensure_schema(self) -> None:
         """Create tables and indexes if they do not exist."""
-        self._conn.executescript(_SCHEMA_SQL)
-        ensure_review_columns(self._conn)
-        ensure_users_table(self._conn)
+        with self._engine.begin() as conn:
+            # Execute each statement separately (text() doesn't support multi-statement SQL)
+            for statement in _SCHEMA_SQL.strip().split(";"):
+                statement = statement.strip()
+                if statement:
+                    conn.execute(text(statement))
+            # Note: ensure_review_columns and ensure_users_table still expect raw connection
+            # Get the underlying DBAPI connection (guaranteed non-None in active connection)
+            dbapi_conn = conn.connection.dbapi_connection
+            assert dbapi_conn is not None  # type narrowing for type checker
+            # Cast to sqlite3.Connection for type checker (it's a DBAPIConnection at runtime)
+            ensure_review_columns(cast(sqlite3.Connection, dbapi_conn))
+            ensure_users_table(cast(sqlite3.Connection, dbapi_conn))
 
     def _check_open(self) -> None:
         """Raise if the store has been closed."""
@@ -85,11 +131,11 @@ class RemoteStore:
             raise RuntimeError("RemoteStore is closed")
 
     def close(self) -> None:
-        """Close the underlying database connection."""
+        """Dispose of the underlying engine and connection pool."""
         if self._closed:
             return
         self._closed = True
-        self._conn.close()
+        self._engine.dispose()
 
     def __enter__(self) -> "RemoteStore":
         """Enter the context manager."""
@@ -101,13 +147,13 @@ class RemoteStore:
         _exc_val: BaseException | None,
         _exc_tb: TracebackType | None,
     ) -> None:
-        """Exit the context manager, closing the connection."""
+        """Exit the context manager, closing the engine."""
         self.close()
 
     @property
-    def db_path(self) -> Path:
-        """Path to the SQLite database file."""
-        return self._db_path
+    def database_url(self) -> str:
+        """Database URL used by this store."""
+        return self._database_url
 
     def insert(self, unit: KnowledgeUnit) -> None:
         """Insert a knowledge unit into the store.
@@ -116,7 +162,7 @@ class RemoteStore:
             unit: The knowledge unit to insert.
 
         Raises:
-            sqlite3.IntegrityError: If a unit with the same ID already exists.
+            IntegrityError: If a unit with the same ID already exists.
             ValueError: If domain normalization results in no valid domains.
         """
         self._check_open()
@@ -128,15 +174,18 @@ class RemoteStore:
         created_at = (
             unit.evidence.first_observed.isoformat() if unit.evidence.first_observed else datetime.now(UTC).isoformat()
         )
-        with self._lock, self._conn:
-            self._conn.execute(
-                "INSERT INTO knowledge_units (id, data, created_at, tier) VALUES (?, ?, ?, ?)",
-                (unit.id, data, created_at, unit.tier.value),
+        with self._engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO knowledge_units (id, data, created_at, tier) VALUES (:id, :data, :created_at, :tier)"
+                ),
+                {"id": unit.id, "data": data, "created_at": created_at, "tier": unit.tier.value},
             )
-            self._conn.executemany(
-                "INSERT INTO knowledge_unit_domains (unit_id, domain) VALUES (?, ?)",
-                [(unit.id, d) for d in domains],
-            )
+            for domain in domains:
+                conn.execute(
+                    text("INSERT INTO knowledge_unit_domains (unit_id, domain) VALUES (:unit_id, :domain)"),
+                    {"unit_id": unit.id, "domain": domain},
+                )
 
     def get(self, unit_id: str) -> KnowledgeUnit | None:
         """Retrieve an approved knowledge unit by ID.
@@ -151,10 +200,10 @@ class RemoteStore:
             The knowledge unit, or None if not found or not approved.
         """
         self._check_open()
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT data FROM knowledge_units WHERE id = ? AND status = 'approved'",
-                (unit_id,),
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT data FROM knowledge_units WHERE id = :id AND status = 'approved'"),
+                {"id": unit_id},
             ).fetchone()
         if row is None:
             return None
@@ -172,10 +221,10 @@ class RemoteStore:
             The knowledge unit, or None if not found.
         """
         self._check_open()
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT data FROM knowledge_units WHERE id = ?",
-                (unit_id,),
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT data FROM knowledge_units WHERE id = :id"),
+                {"id": unit_id},
             ).fetchone()
         if row is None:
             return None
@@ -192,10 +241,10 @@ class RemoteStore:
             if the unit does not exist.
         """
         self._check_open()
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT status, reviewed_by, reviewed_at FROM knowledge_units WHERE id = ?",
-                (unit_id,),
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT status, reviewed_by, reviewed_at FROM knowledge_units WHERE id = :id"),
+                {"id": unit_id},
             ).fetchone()
         if row is None:
             return None
@@ -214,12 +263,15 @@ class RemoteStore:
         """
         self._check_open()
         now = datetime.now(UTC).isoformat()
-        with self._lock, self._conn:
-            cursor = self._conn.execute(
-                "UPDATE knowledge_units SET status = ?, reviewed_by = ?, reviewed_at = ? WHERE id = ?",
-                (status, reviewed_by, now, unit_id),
+        with self._engine.begin() as conn:
+            result = conn.execute(
+                text(
+                    "UPDATE knowledge_units SET status = :status, reviewed_by = :reviewed_by, "
+                    "reviewed_at = :reviewed_at WHERE id = :id"
+                ),
+                {"status": status, "reviewed_by": reviewed_by, "reviewed_at": now, "id": unit_id},
             )
-            if cursor.rowcount == 0:
+            if result.rowcount == 0:
                 raise KeyError(f"Knowledge unit not found: {unit_id}")
 
     def delete(self, unit_id: str) -> None:
@@ -232,12 +284,12 @@ class RemoteStore:
             KeyError: If no unit with the given ID exists.
         """
         self._check_open()
-        with self._lock, self._conn:
-            cursor = self._conn.execute(
-                "DELETE FROM knowledge_units WHERE id = ?",
-                (unit_id,),
+        with self._engine.begin() as conn:
+            result = conn.execute(
+                text("DELETE FROM knowledge_units WHERE id = :id"),
+                {"id": unit_id},
             )
-            if cursor.rowcount == 0:
+            if result.rowcount == 0:
                 raise KeyError(f"Knowledge unit not found: {unit_id}")
 
     def update(self, unit: KnowledgeUnit) -> None:
@@ -256,21 +308,22 @@ class RemoteStore:
             raise ValueError("At least one non-empty domain is required")
         unit = unit.model_copy(update={"domains": domains})
         data = unit.model_dump_json()
-        with self._lock, self._conn:
-            cursor = self._conn.execute(
-                "UPDATE knowledge_units SET data = ?, tier = ? WHERE id = ?",
-                (data, unit.tier.value, unit.id),
+        with self._engine.begin() as conn:
+            result = conn.execute(
+                text("UPDATE knowledge_units SET data = :data, tier = :tier WHERE id = :id"),
+                {"data": data, "tier": unit.tier.value, "id": unit.id},
             )
-            if cursor.rowcount == 0:
+            if result.rowcount == 0:
                 raise KeyError(f"Knowledge unit not found: {unit.id}")
-            self._conn.execute(
-                "DELETE FROM knowledge_unit_domains WHERE unit_id = ?",
-                (unit.id,),
+            conn.execute(
+                text("DELETE FROM knowledge_unit_domains WHERE unit_id = :unit_id"),
+                {"unit_id": unit.id},
             )
-            self._conn.executemany(
-                "INSERT INTO knowledge_unit_domains (unit_id, domain) VALUES (?, ?)",
-                [(unit.id, d) for d in domains],
-            )
+            for domain in domains:
+                conn.execute(
+                    text("INSERT INTO knowledge_unit_domains (unit_id, domain) VALUES (:unit_id, :domain)"),
+                    {"unit_id": unit.id, "domain": domain},
+                )
 
     def query(
         self,
@@ -305,8 +358,9 @@ class RemoteStore:
         normalized = normalize_domains(domains)
         if not normalized:
             return []
-        # Safe: placeholders is only '?' characters, never user input.
-        placeholders = ",".join("?" for _ in normalized)
+        # Build named parameters for each domain
+        params = {f"domain_{i}": d for i, d in enumerate(normalized)}
+        placeholders = ",".join(f":{name}" for name in params)
         sql = f"""
             SELECT ku.data
             FROM knowledge_units ku
@@ -317,8 +371,8 @@ class RemoteStore:
                 WHERE domain IN ({placeholders})
             )
         """
-        with self._lock:
-            rows = self._conn.execute(sql, normalized).fetchall()
+        with self._engine.connect() as conn:
+            rows = conn.execute(text(sql), params).fetchall()
 
         # PoC: all filtering and scoring is in-memory after deserialization.
         # For larger stores, push coarse filters into SQL.
@@ -340,20 +394,23 @@ class RemoteStore:
     def count(self) -> int:
         """Return the total number of knowledge units in the store."""
         self._check_open()
-        with self._lock:
-            row = self._conn.execute("SELECT COUNT(*) FROM knowledge_units").fetchone()
+        with self._engine.connect() as conn:
+            row = conn.execute(text("SELECT COUNT(*) FROM knowledge_units")).fetchone()
+        assert row is not None  # COUNT always returns a row
         return row[0]
 
     def domain_counts(self) -> dict[str, int]:
         """Return the count of approved knowledge units per domain tag."""
         self._check_open()
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT d.domain, COUNT(*) "
-                "FROM knowledge_unit_domains d "
-                "JOIN knowledge_units ku ON ku.id = d.unit_id "
-                "WHERE ku.status = 'approved' "
-                "GROUP BY d.domain ORDER BY COUNT(*) DESC"
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT d.domain, COUNT(*) "
+                    "FROM knowledge_unit_domains d "
+                    "JOIN knowledge_units ku ON ku.id = d.unit_id "
+                    "WHERE ku.status = 'approved' "
+                    "GROUP BY d.domain ORDER BY COUNT(*) DESC"
+                )
             ).fetchall()
         return {row[0]: row[1] for row in rows}
 
@@ -369,12 +426,14 @@ class RemoteStore:
             and reviewed_at keys.
         """
         self._check_open()
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT data, status, reviewed_by, reviewed_at "
-                "FROM knowledge_units WHERE status = 'pending' "
-                "ORDER BY created_at ASC LIMIT ? OFFSET ?",
-                (limit, offset),
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT data, status, reviewed_by, reviewed_at "
+                    "FROM knowledge_units WHERE status = 'pending' "
+                    "ORDER BY created_at ASC LIMIT :limit OFFSET :offset"
+                ),
+                {"limit": limit, "offset": offset},
             ).fetchall()
         return [
             {
@@ -389,23 +448,24 @@ class RemoteStore:
     def pending_count(self) -> int:
         """Return the number of pending KUs."""
         self._check_open()
-        with self._lock:
-            row = self._conn.execute("SELECT COUNT(*) FROM knowledge_units WHERE status = 'pending'").fetchone()
+        with self._engine.connect() as conn:
+            row = conn.execute(text("SELECT COUNT(*) FROM knowledge_units WHERE status = 'pending'")).fetchone()
+        assert row is not None  # COUNT always returns a row
         return row[0]
 
     def counts_by_status(self) -> dict[str, int]:
         """Return KU counts grouped by review status."""
         self._check_open()
-        with self._lock:
-            rows = self._conn.execute("SELECT status, COUNT(*) FROM knowledge_units GROUP BY status").fetchall()
+        with self._engine.connect() as conn:
+            rows = conn.execute(text("SELECT status, COUNT(*) FROM knowledge_units GROUP BY status")).fetchall()
         return {row[0]: row[1] for row in rows}
 
     def counts_by_tier(self) -> dict[str, int]:
         """Return approved KU counts grouped by tier."""
         self._check_open()
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT tier, COUNT(*) FROM knowledge_units WHERE status = 'approved' GROUP BY tier"
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                text("SELECT tier, COUNT(*) FROM knowledge_units WHERE status = 'approved' GROUP BY tier")
             ).fetchall()
         return {row[0]: row[1] for row in rows}
 
@@ -435,19 +495,19 @@ class RemoteStore:
             and reviewed_at keys.
         """
         self._check_open()
-        params: list[str] = []
+        params: dict[str, Any] = {}
         conditions: list[str] = []
 
         if status:
-            conditions.append("ku.status = ?")
-            params.append(status)
+            conditions.append("ku.status = :status")
+            params["status"] = status
 
         if domain:
             normalized = normalize_domains([domain])
             if not normalized:
                 return []
-            conditions.append("ku.id IN (  SELECT DISTINCT unit_id FROM knowledge_unit_domains WHERE domain = ?)")
-            params.append(normalized[0])
+            conditions.append("ku.id IN (SELECT DISTINCT unit_id FROM knowledge_unit_domains WHERE domain = :domain)")
+            params["domain"] = normalized[0]
 
         has_confidence_filter = confidence_min is not None or confidence_max is not None
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
@@ -457,8 +517,8 @@ class RemoteStore:
             f"FROM knowledge_units ku {where} "
             f"ORDER BY ku.created_at DESC {sql_limit}"
         )
-        with self._lock:
-            rows = self._conn.execute(sql, params).fetchall()
+        with self._engine.connect() as conn:
+            rows = conn.execute(text(sql), params).fetchall()
 
         results = []
         for row in rows:
@@ -488,14 +548,17 @@ class RemoteStore:
             password_hash: Bcrypt hash of the user's password.
 
         Raises:
-            sqlite3.IntegrityError: If a user with the same username already exists.
+            IntegrityError: If a user with the same username already exists.
         """
         self._check_open()
         now = datetime.now(UTC).isoformat()
-        with self._lock, self._conn:
-            self._conn.execute(
-                "INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
-                (username, password_hash, now),
+        with self._engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO users (username, password_hash, created_at) "
+                    "VALUES (:username, :password_hash, :created_at)"
+                ),
+                {"username": username, "password_hash": password_hash, "created_at": now},
             )
 
     def get_user(self, username: str) -> dict[str, str] | None:
@@ -509,10 +572,10 @@ class RemoteStore:
             if no user with that username exists.
         """
         self._check_open()
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT username, password_hash, created_at FROM users WHERE username = ?",
-                (username,),
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT username, password_hash, created_at FROM users WHERE username = :username"),
+                {"username": username},
             ).fetchone()
         if row is None:
             return None
@@ -521,8 +584,8 @@ class RemoteStore:
     def confidence_distribution(self) -> dict[str, int]:
         """Return confidence distribution buckets for approved KUs."""
         self._check_open()
-        with self._lock:
-            rows = self._conn.execute("SELECT data FROM knowledge_units WHERE status = 'approved'").fetchall()
+        with self._engine.connect() as conn:
+            rows = conn.execute(text("SELECT data FROM knowledge_units WHERE status = 'approved'")).fetchall()
         buckets = {"0.0-0.3": 0, "0.3-0.6": 0, "0.6-0.8": 0, "0.8-1.0": 0}
         for (data,) in rows:
             unit = KnowledgeUnit.model_validate_json(data)
@@ -551,12 +614,14 @@ class RemoteStore:
             List of activity event dicts, newest first.
         """
         self._check_open()
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT id, data, status, reviewed_by, reviewed_at "
-                "FROM knowledge_units "
-                "ORDER BY COALESCE(reviewed_at, created_at) DESC LIMIT ?",
-                (limit * 2,),
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT id, data, status, reviewed_by, reviewed_at "
+                    "FROM knowledge_units "
+                    "ORDER BY COALESCE(reviewed_at, created_at) DESC LIMIT :limit"
+                ),
+                {"limit": limit * 2},
             ).fetchall()
         activity = []
         for row in rows:
@@ -606,30 +671,39 @@ class RemoteStore:
         if days <= 0:
             raise ValueError("days must be positive")
         self._check_open()
-        cutoff = f"-{days} days"
-        with self._lock:
-            proposed_rows = self._conn.execute(
-                "SELECT date(created_at) as day, COUNT(*) as cnt "
-                "FROM knowledge_units "
-                "WHERE created_at >= date('now', ?) "
-                "GROUP BY day",
-                (cutoff,),
+
+        # Compute cutoff date in Python (portable across backends)
+        cutoff = (datetime.now(UTC) - timedelta(days=days)).date().isoformat()
+
+        with self._engine.connect() as conn:
+            proposed_rows = conn.execute(
+                text(
+                    "SELECT DATE(created_at) as day, COUNT(*) as cnt "
+                    "FROM knowledge_units "
+                    "WHERE created_at >= :cutoff "
+                    "GROUP BY DATE(created_at)"
+                ),
+                {"cutoff": cutoff},
             ).fetchall()
-            approved_rows = self._conn.execute(
-                "SELECT date(reviewed_at) as day, COUNT(*) as cnt "
-                "FROM knowledge_units "
-                "WHERE status = 'approved' "
-                "AND reviewed_at >= date('now', ?) "
-                "GROUP BY day",
-                (cutoff,),
+            approved_rows = conn.execute(
+                text(
+                    "SELECT DATE(reviewed_at) as day, COUNT(*) as cnt "
+                    "FROM knowledge_units "
+                    "WHERE status = 'approved' "
+                    "AND reviewed_at >= :cutoff "
+                    "GROUP BY DATE(reviewed_at)"
+                ),
+                {"cutoff": cutoff},
             ).fetchall()
-            rejected_rows = self._conn.execute(
-                "SELECT date(reviewed_at) as day, COUNT(*) as cnt "
-                "FROM knowledge_units "
-                "WHERE status = 'rejected' "
-                "AND reviewed_at >= date('now', ?) "
-                "GROUP BY day",
-                (cutoff,),
+            rejected_rows = conn.execute(
+                text(
+                    "SELECT DATE(reviewed_at) as day, COUNT(*) as cnt "
+                    "FROM knowledge_units "
+                    "WHERE status = 'rejected' "
+                    "AND reviewed_at >= :cutoff "
+                    "GROUP BY DATE(reviewed_at)"
+                ),
+                {"cutoff": cutoff},
             ).fetchall()
         proposed = {row[0]: row[1] for row in proposed_rows}
         approved = {row[0]: row[1] for row in approved_rows}
